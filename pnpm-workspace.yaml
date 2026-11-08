@@ -3,6 +3,7 @@ packages:
 
 allowBuilds:
   esbuild: true
+  koffi: true
 
 minimumReleaseAgeExclude:
   - '@deepseek-ai/dsh-agent-loop-testkit@0.2.0-rc.2'
