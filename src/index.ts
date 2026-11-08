@@ -7,16 +7,15 @@
  * `defer_execute_tool`. A `tools/pre-execute` listener blocks direct calls to
  * not-yet-loaded deferred tools with a pointer back to the search tools.
  *
- * Hiding happens on the one list that actually reaches the model: the
- * per-scope value of the `system-prompt/assemble` waterfall, which the agent
- * loop turns into the request header and the provider's tool declarations.
- * The plugin therefore never mutates the tool registry, and it does not care
- * WHERE a tool comes from — the host composition, a per-session agent preset,
- * an MCP server, or a plugin registering late. That distinction is the whole
- * point on the Web/Desktop surfaces, where every model-facing tool is mounted
- * by an agent preset into the session's scope rather than into the global
- * layer: a global-registry view reads zero model-facing tools there, so
- * registry-side filtering would silently defer nothing.
+ * Hiding happens at DSH 0.2.2's per-scope restriction layer: every agent gets
+ * its own `agent.ctx.tools.restrict({ deny })` mask over the inherited tool
+ * set. That one view feeds the model-facing declarations, the PTC `tools:sdk`
+ * prompt section, and dispatch, so a masked tool is invisible everywhere at
+ * once. Restrictions mask INHERITED tools, which is exactly where an agent
+ * preset mounts its rows — the preset generation scope is the agent scope's
+ * parent — so one call masks preset tools exactly like host or MCP tools. The
+ * plugin still never registers, replaces, or shadows a deferred tool; it only
+ * masks names it does not own.
  *
  * This plugin does NOT own or implement any deferred tool. Deferred tools are
  * ordinary registry tools; the plugin only observes their schemas in the
@@ -64,9 +63,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolSchema } from '@deepseek-ai/dsh-llm'
-import type { AssembleContext, PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import z from '@deepseek-ai/schemastery'
-import { applyDefaultPreset, resolveDeferConfig, type LazyToolsConfig } from './config.ts'
+import { applyDefaultPreset, isGuardTool, resolveDeferConfig, RUN_CODE_NAME, type LazyToolsConfig } from './config.ts'
 import { buildTools, type LoadStatus, type ToolsAccess } from './tools.ts'
 import { autoTune, describeOutcome, resolveAutoTuneOptions } from './autotune.ts'
 import { applyProjectOverride, readProjectOverride, readStoreSync } from './project-config.ts'
@@ -176,7 +174,7 @@ function configSnapshot(config: LiveConfig): Config {
 /** One agent's owned tools, catalog, and search state. */
 interface AgentState {
   readonly agent: Agent
-  /** Schemas the last assembly offered this scope — deferred ones included. */
+  /** Every schema the unrestricted registry view offers this scope — deferred ones included. */
   catalog: ToolSchema[]
   /** Catalog names still withheld from the model (patterns minus activations). */
   deferredNames: Set<string>
@@ -184,6 +182,10 @@ interface AgentState {
   readonly activated: Set<string>
   removePreExecute: (() => void) | undefined
   removeTools: (() => void)[]
+  /** This agent's own mask over inherited tools, while one is in force. */
+  removeRestriction: (() => void) | undefined
+  /** Deny list the live mask was built from; empty when no mask is in force. */
+  restrictionSignature: string
 }
 
 /**
@@ -195,6 +197,11 @@ interface AgentState {
 export function apply(ctx: Context, config: LiveConfig): void {
   const states = new Map<Agent, AgentState>()
   const home = ctx.get('profileContext')?.home
+  /**
+   * Depth of registry mutations this plugin is performing itself. Every mask
+   * swap fires `tools/change`; re-ranking from inside our own swap would loop.
+   */
+  let muting = 0
 
   // This plugin ships its own settings page (the browser half in ./client), so
   // it opts out of the settings plane's schema-derived automatic form. Without
@@ -290,7 +297,7 @@ export function apply(ctx: Context, config: LiveConfig): void {
         for (const state of states.values()) {
           if (state.agent.session?.header.cwd !== cwd) continue
           try {
-            rankFromRegistry(state)
+            refresh(state)
           } catch (error: unknown) {
             ctx.logger.warn(`lazy-tools: re-rank after auto-tune failed (${errorMessage(error)}); keeping the previous catalog`)
           }
@@ -310,11 +317,11 @@ export function apply(ctx: Context, config: LiveConfig): void {
   }
 
   /**
-   * Re-rank one agent against a freshly assembled tool list. The catalog
-   * becomes exactly what the registry offers this scope — whatever plane
-   * registered it — and the defer patterns in force for THIS agent's project
-   * are re-applied over its names with the guards and this agent's prior
-   * activations excluded.
+   * Re-rank one agent against a freshly read registry view. The catalog
+   * becomes exactly what the unrestricted registry offers this scope —
+   * whatever plane registered it — and the defer patterns in force for THIS
+   * agent's project are re-applied over its names with the guards and this
+   * agent's prior activations excluded.
    */
   function rank(state: AgentState, schemas: readonly ToolSchema[]): void {
     state.catalog = [...schemas]
@@ -325,9 +332,102 @@ export function apply(ctx: Context, config: LiveConfig): void {
     state.deferredNames = new Set([...deferNames].filter((name) => !state.activated.has(name)))
   }
 
-  /** Re-rank one agent from its live registry view — host plane and ancestor planes. */
-  function rankFromRegistry(state: AgentState): void {
-    rank(state, ctx.tools.schemas(state.agent))
+  /** Names a mask would hide: the deferred set minus the guard transports. */
+  function denyNames(state: AgentState): string[] {
+    return [...state.deferredNames].filter((name) => !isGuardTool(name))
+  }
+
+  /** Stable signature of a deny list, so a no-op refresh does not re-mask. */
+  function signatureOf(deny: readonly string[]): string {
+    return [...deny].sort().join('\n')
+  }
+
+  /**
+   * Names a rejected `tools.restrict()` call reported as unknown. The error
+   * lists only the offenders before its "known global tools" tail.
+   */
+  function unknownRestrictionNames(error: unknown): Set<string> {
+    const names = new Set<string>()
+    if (!(error instanceof Error)) return names
+    const match = /unknown global tool(?:s)? ((?:"[^"]+"[,\s]*)+)/.exec(error.message)
+    if (match === null) return names
+    for (const quoted of match[1].matchAll(/"([^"]+)"/g)) names.add(quoted[1])
+    return names
+  }
+
+  /** Lift this agent's mask and forget the signature it stood for. */
+  function liftRestriction(state: AgentState): void {
+    state.removeRestriction?.()
+    state.removeRestriction = undefined
+    state.restrictionSignature = ''
+  }
+
+  /**
+   * Re-apply this agent's mask over inherited tools.
+   *
+   * A mask is the deferred set minus the guards: the guard pair lives in this
+   * agent's OWN scope and is exempt by construction, and the reserved
+   * `run_code` transport may not be named at all. Restrictions cannot be
+   * edited in place, only lifted and re-added, and every registry mutation
+   * fires `tools/change` — so the mask is replaced only when the deny set
+   * actually moved, and the whole swap runs muted.
+   *
+   * Fail-open: a rejected mask (for example a name that is not inherited) is
+   * logged and the call guard still withholds the deferred set.
+   */
+  function applyRestriction(state: AgentState): void {
+    const deny = denyNames(state)
+    const signature = signatureOf(deny)
+    if (signature === state.restrictionSignature) return
+    muting += 1
+    try {
+      liftRestriction(state)
+      if (deny.length === 0) return
+      let remaining = deny
+      for (;;) {
+        try {
+          state.removeRestriction = state.agent.ctx.tools.restrict({ deny: remaining })
+          state.restrictionSignature = signature
+          return
+        } catch (error: unknown) {
+          // A tool registered in this agent's own scope is exempt from
+          // restrictions and cannot be named; drop exactly those and mask the rest.
+          const unknown = unknownRestrictionNames(error)
+          const next = remaining.filter((name) => !unknown.has(name))
+          if (next.length === 0 || next.length === remaining.length) {
+            ctx.logger.warn(`lazy-tools: could not mask deferred tools (${errorMessage(error)}); the call guard still withholds them`)
+            return
+          }
+          remaining = next
+        }
+      }
+    } finally {
+      muting -= 1
+    }
+  }
+
+  /**
+   * Read this scope's registry view with the plugin's own mask lifted.
+   *
+   * `schemas()` applies restrictions, so reading it while masked would shrink
+   * the catalog to the already-visible set and silently drop every deferred
+   * name from `tool_search`. The mask is lifted only for this read.
+   */
+  function schemasUnrestricted(state: AgentState): ToolSchema[] {
+    if (state.removeRestriction === undefined) return ctx.tools.schemas(state.agent)
+    muting += 1
+    try {
+      liftRestriction(state)
+      return ctx.tools.schemas(state.agent)
+    } finally {
+      muting -= 1
+    }
+  }
+
+  /** Re-rank one agent from its unrestricted view and refresh its mask. */
+  function refresh(state: AgentState): void {
+    rank(state, schemasUnrestricted(state))
+    applyRestriction(state)
   }
 
   /** Build the per-agent {@link ToolsAccess} the two tools consume. */
@@ -351,6 +451,9 @@ export function apply(ctx: Context, config: LiveConfig): void {
           }
           statuses.set(name, 'already_loaded')
         }
+        // Dropping names from the deferred set is a mask edit, not a re-rank:
+        // the catalog and the patterns are unchanged.
+        applyRestriction(state)
         return statuses
       },
     }
@@ -366,6 +469,8 @@ export function apply(ctx: Context, config: LiveConfig): void {
       activated: new Set(),
       removePreExecute: undefined,
       removeTools: [],
+      removeRestriction: undefined,
+      restrictionSignature: '',
     }
     states.set(agent, state)
     try {
@@ -375,11 +480,11 @@ export function apply(ctx: Context, config: LiveConfig): void {
         agent.ctx.tools.register(tools.toolSearch),
         agent.ctx.tools.register(tools.deferExecuteTool),
       ]
-      rankFromRegistry(state)
+      refresh(state)
       // Block direct calls to not-yet-loaded deferred tools with a hint.
       state.removePreExecute = agent.ctx.on('tools/pre-execute', (exec, next) => {
         const toolName = exec.name
-        if (toolName === TOOL_SEARCH_NAME || toolName === DEFER_EXECUTE_TOOL_NAME) return next()
+        if (isGuardTool(toolName)) return next()
         if (state.deferredNames.has(toolName)) {
           return Promise.resolve({
             kind: 'deny',
@@ -403,42 +508,27 @@ export function apply(ctx: Context, config: LiveConfig): void {
     states.delete(agent)
     for (const remove of state.removeTools) remove()
     state.removePreExecute?.()
+    liftRestriction(state)
   }
 
-  /**
-   * Withhold this scope's deferred tools from the model. The waterfall value is
-   * authoritative for the request, so filtering here is the whole hiding
-   * mechanism — and because the assembly is rebuilt per step, this same hook is
-   * what re-ranks the catalog when the registry changes.
-   *
-   * Fail-open by design: this listener sits on the request path, so a defect in
-   * it must degrade to "every tool offered", never to a failed model request.
-   */
-  ctx.on('system-prompt/assemble', async (assembly: PromptAssembly, context: AssembleContext) => {
-    try {
-      const scope = context.scope
-      const state = scope === undefined ? undefined : states.get(scope as Agent)
-      if (state === undefined) return assembly
-      rank(state, assembly.tools)
-      const offered = assembly.tools.filter((schema) => !state.deferredNames.has(schema.name))
-      return offered.length === assembly.tools.length ? assembly : { ...assembly, tools: offered }
-    } catch (error: unknown) {
-      ctx.logger.warn(`lazy-tools: assembly filtering failed (${errorMessage(error)}); offering every tool for this request`)
-      return assembly
-    }
-  })
+  // DSH 0.2.2 assembles the presentation without the tool declarations: the
+  // model-facing list and the PTC `tools:sdk` section both come from the
+  // restricted registry view this plugin masks per agent. There is nothing
+  // left to filter here, so the old `system-prompt/assemble` listener is gone.
   ctx.on('agent/created', ({ agent }) => {
     install(agent)
     tuneForAgent(agent)
   })
   ctx.on('agent/disposed', ({ agent }) => { uninstall(agent) })
-  // Keep the guard and the search catalog current between assemblies — a tool
+  // Keep the mask and the search catalog current between requests — a tool
   // mounted by a preset or an MCP server does not wait for the next request.
+  // Our own mask swaps fire this event too; `muting` keeps them from re-entering.
   // A failure here must not break the registry mutation that notified us.
   ctx.on('tools/change', () => {
+    if (muting > 0) return
     for (const state of states.values()) {
       try {
-        rankFromRegistry(state)
+        refresh(state)
       } catch (error: unknown) {
         ctx.logger.warn(`lazy-tools: re-rank failed (${errorMessage(error)}); keeping the previous catalog`)
       }
@@ -450,9 +540,10 @@ export function apply(ctx: Context, config: LiveConfig): void {
   // `volatile-update` carries only the paths whose value actually moved, so a
   // no-op save does not churn the catalog.
   ctx.on('loader/volatile-update', () => {
+    if (muting > 0) return
     for (const state of states.values()) {
       try {
-        rankFromRegistry(state)
+        refresh(state)
       } catch (error: unknown) {
         ctx.logger.warn(`lazy-tools: re-rank after a configuration change failed (${errorMessage(error)}); keeping the previous catalog`)
       }

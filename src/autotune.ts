@@ -137,6 +137,7 @@ export async function mine(
         return await scanHistory({
           cwd,
           windowDays: options.windowDays,
+          ...options.now === undefined ? {} : { now: options.now },
           ...options.home === undefined ? {} : { home: options.home },
           sessionIds,
           readEvents: async (id) => (await query.readSession(id)).events,
@@ -149,6 +150,7 @@ export async function mine(
   return await scanHistory({
     cwd,
     windowDays: options.windowDays,
+    ...options.now === undefined ? {} : { now: options.now },
     ...options.home === undefined ? {} : { home: options.home },
   })
 }

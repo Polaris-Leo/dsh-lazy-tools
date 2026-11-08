@@ -20,6 +20,7 @@ const ALL_TOOLS = [
   'tool_search',
   'defer_execute_tool',
   RUN_CODE_NAME,
+  'agy_tool',
 ]
 
 /** Core tools plus a few long-tail ones, for the preset assertions. */
@@ -31,6 +32,7 @@ const PRESET_CATALOG = [
   'glob',
   'grep',
   'read_image',
+  'codex_sketch',
   'todo_write',
   'subagent',
   'web_search',
@@ -155,6 +157,7 @@ describe('resolveDeferConfig', () => {
     // The reserved PTC transport is the only tool a ptc-mode agent sees, so it
     // must survive Defer(*) too.
     expect(r.defer.includes(RUN_CODE_NAME)).toBe(false)
+    expect(r.defer.includes('agy_tool')).toBe(false)
     // Everything else, bash included, is deferred.
     expect(r.defer).toContain('bash')
   })
@@ -177,7 +180,9 @@ describe('applyDefaultPreset', () => {
     // The compiled result must leave exactly the core callable and defer the
     // long tail.
     const compiled = resolveDeferConfig(PRESET_CATALOG, patterns)
-    expect([...compiled.deferNames].sort()).toEqual(['read_image', 'subagent', 'todo_write'])
+    // read_image is a host tool and stays active; only third-party heavy tools defer
+    expect([...compiled.deferNames].sort()).toEqual(['codex_sketch'])
+    // Tool-slim keep strategy keeps common basic tools (including subagent, todo_write) active
     expect(PRESET_CATALOG.filter((name) => !compiled.deferNames.has(name)).sort()).toEqual([
       'bash',
       'defer_execute_tool',
@@ -185,24 +190,54 @@ describe('applyDefaultPreset', () => {
       'glob',
       'grep',
       'read',
+      'read_image',
       'run_code',
+      'subagent',
+      'todo_write',
       'tool_search',
       'web_search',
       'write',
     ])
   })
 
-  it('lets an explicit config replace the preset entirely', () => {
-    // Naming `defer` must not silently re-protect the name through the preset
-    // core: `defer: ['glob']` defers glob even though glob ships in the core.
-    const patterns = applyDefaultPreset({ defer: ['glob'] })
-    expect(patterns.defer).toEqual(['glob'])
-    expect(patterns.noDefer).toEqual([])
-    expect([...resolveDeferConfig(PRESET_CATALOG, patterns).deferNames]).toEqual(['glob'])
+  it('retains DEFAULT_ACTIVE_TOOLS as baseline when only Defer(*) is configured', () => {
+    const patterns = applyDefaultPreset({ defer: [DEFER_ALL_ENTRY] })
+    expect(patterns.defer).toEqual([DEFER_ALL_ENTRY])
+    expect(patterns.noDefer).toEqual([...DEFAULT_ACTIVE_TOOLS])
+
+    const compiled = resolveDeferConfig(PRESET_CATALOG, patterns)
+    expect([...compiled.deferNames].sort()).toEqual(['codex_sketch'])
+    expect(compiled.noDeferNames.has('read')).toBe(true)
+    expect(compiled.noDeferNames.has('grep')).toBe(true)
+  })
+
+  it('retains DEFAULT_ACTIVE_TOOLS as baseline when defer-only is configured', () => {
+    const patterns = applyDefaultPreset({ defer: ['read_image'] })
+    expect(patterns.defer).toEqual(['read_image'])
+    // An explicitly deferred tool leaves the baseline whitelist.
+    expect(patterns.noDefer).toEqual(DEFAULT_ACTIVE_TOOLS.filter((name) => name !== 'read_image'))
+
+    const compiled = resolveDeferConfig(PRESET_CATALOG, patterns)
+    expect([...compiled.deferNames]).toEqual(['read_image'])
+    expect(compiled.noDeferNames.has('read')).toBe(true)
+    expect(compiled.noDeferNames.has('grep')).toBe(true)
+  })
+
+  it('lets explicit noDefer override the default active whitelist', () => {
+    const patterns = applyDefaultPreset({ defer: [DEFER_ALL_ENTRY], noDefer: ['bash'] })
+    expect(patterns.defer).toEqual([DEFER_ALL_ENTRY])
+    expect(patterns.noDefer).toEqual(['bash'])
   })
 
   it('keeps an explicit empty defer meaning "defer nothing"', () => {
     const patterns = applyDefaultPreset({ defer: [] })
+    expect(patterns.defer).toEqual([])
+    expect(patterns.noDefer).toEqual([...DEFAULT_ACTIVE_TOOLS])
+    expect(resolveDeferConfig(PRESET_CATALOG, patterns).deferNames.size).toBe(0)
+  })
+
+  it('lets an explicit empty pair clear both lists', () => {
+    const patterns = applyDefaultPreset({ defer: [], noDefer: [] })
     expect(patterns.defer).toEqual([])
     expect(patterns.noDefer).toEqual([])
     expect(resolveDeferConfig(PRESET_CATALOG, patterns).deferNames.size).toBe(0)

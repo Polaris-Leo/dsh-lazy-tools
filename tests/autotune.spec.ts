@@ -95,7 +95,7 @@ describe('mine', () => {
         other: { cwd: '/Users/dev/elsewhere', events: callsFor([['edit', 99]]) },
       }),
     }).ctx
-    const ranking = await mine(ctx, CWD, { enabled: true, windowDays: 30, topN: 20, minSamples: 0 })
+    const ranking = await mine(ctx, CWD, { enabled: true, windowDays: 30, topN: 20, minSamples: 0, now: NOW })
     expect(ranking?.ranked).toEqual([{ name: 'bash', count: 3 }])
     expect(ranking?.sessionsScanned).toBe(1)
   })
@@ -108,7 +108,7 @@ describe('mine', () => {
       },
     }).ctx
     // No real sessions exist under this temp home, so the fallback finds none.
-    const ranking = await mine(ctx, CWD, { enabled: true, windowDays: 30, topN: 20, minSamples: 0, home: '/nonexistent-home' })
+    const ranking = await mine(ctx, CWD, { enabled: true, windowDays: 30, topN: 20, minSamples: 0, home: '/nonexistent-home', now: NOW })
     expect(ranking).toBeUndefined()
   })
 
@@ -122,7 +122,7 @@ describe('mine', () => {
 })
 
 describe('autoTune', () => {
-  const options = { enabled: true, windowDays: 30, topN: 20, minSamples: 10 }
+  const options = { enabled: true, windowDays: 30, topN: 20, minSamples: 10, now: NOW }
 
   it('records a per-project override instead of touching the global config', async () => {
     const home = tempHome()

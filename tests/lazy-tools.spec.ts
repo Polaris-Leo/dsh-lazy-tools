@@ -4,19 +4,17 @@ import type { Fiber } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { bindScopeParent, createScope } from '@deepseek-ai/dsh-scope'
 import { SessionId, type JsonValue } from '@deepseek-ai/dsh-session'
-import { defineContentToolFixture, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture, executeTool } from './fixture-tools.ts'
 import * as LazyTools from '../src/index.ts'
 import { DEFER_EXECUTE_TOOL_NAME, TOOL_SEARCH_NAME, type Config } from '../src/index.ts'
 
 const contexts: Context[] = []
 const signal = new AbortController().signal
-let callOrdinal = 0
 
 afterEach(async () => {
-  callOrdinal = 0
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
 })
 
@@ -48,14 +46,7 @@ async function execute(
   name: string,
   args: JsonValue,
 ): Promise<ToolExecutionResult> {
-  callOrdinal += 1
-  return await ctx.tools.execute({
-    callId: ToolCallId(`lazy-tools-${callOrdinal}`),
-    name,
-    arguments: args,
-    agent,
-    signal,
-  })
+  return await executeTool(ctx, agent, name, args, undefined, signal)
 }
 
 /** Tool names the model would actually be offered on the next request. */
@@ -161,7 +152,7 @@ describe('deferred tool loading', () => {
     // The Web/Desktop surfaces register model-facing tools in the session's
     // preset scope, so the global registry reads zero of them. Deferral must
     // still see and hide them.
-    const { ctx } = await harness({ defer: ['Defer(*)'] })
+    const { ctx } = await harness({ defer: ['Defer(*)'], noDefer: [] })
     const agent = await createAgent(ctx, 'preset-plane')
     ctx.tools.register(fixture('global_echo', 'A host-plane tool'))
 
@@ -239,8 +230,8 @@ describe('deferred tool loading', () => {
   })
 
   it('guard tools are never deferred even under Defer(*)', async () => {
-    const { ctx } = await harness({ defer: ['Defer(*)'] })
-    ctx.tools.register(fixture('glob', 'Find files by pattern'))
+    const { ctx } = await harness({ defer: ['Defer(*)'], noDefer: [] })
+    ctx.tools.register(fixture('custom_tool', 'A custom tool'))
     const agent = await createAgent(ctx, 'guards')
 
     expect(await offered(ctx, agent)).toEqual([TOOL_SEARCH_NAME, DEFER_EXECUTE_TOOL_NAME].sort())
@@ -255,6 +246,7 @@ describe('deferred tool loading', () => {
     ctx.tools.register(fixture('glob', 'Find files by pattern'))
     ctx.tools.register(fixture('read_image', 'Read an image'))
     ctx.tools.register(fixture('subagent', 'Spawn a subagent'))
+    ctx.tools.register(fixture('codex_sketch', 'Heavy design tool'))
 
     // No configuration at all: the shipped preset must be in effect.
     await ctx.plugin(LazyTools)
@@ -263,16 +255,17 @@ describe('deferred tool loading', () => {
     const names = await offered(ctx, agent)
     expect(names).toContain('read')
     expect(names).toContain('glob')
+    expect(names).toContain('subagent')
     expect(names).toContain(TOOL_SEARCH_NAME)
     expect(names).toContain(DEFER_EXECUTE_TOOL_NAME)
-    expect(names).not.toContain('read_image')
-    expect(names).not.toContain('subagent')
+    expect(names).toContain('read_image')
+    expect(names).not.toContain('codex_sketch')
 
-    const found = await execute(ctx, agent, TOOL_SEARCH_NAME, { tool_names: ['read_image'] })
+    const found = await execute(ctx, agent, TOOL_SEARCH_NAME, { tool_names: ['codex_sketch'] })
     expect(found.isError ? undefined : found.value).toMatchObject({
-      matches: [{ name: 'read_image', status: 'loaded' }],
+      matches: [{ name: 'codex_sketch', status: 'loaded' }],
     })
-    expect(await offered(ctx, agent)).toContain('read_image')
+    expect(await offered(ctx, agent)).toContain('codex_sketch')
   })
 
   it('an explicit defer config replaces the shipped preset', async () => {
@@ -324,5 +317,46 @@ describe('deferred tool loading', () => {
     ctx.emit('agent/disposed', { agent })
     expect(await offered(ctx, agent)).toContain('glob')
     expect(() => { ctx.emit('agent/disposed', { agent }) }).not.toThrow()
+  })
+  it('never defers or blocks agy_tool (AGY bridge mirror tool)', async () => {
+    const { ctx } = await harness({ defer: ['Defer(*)'] })
+    ctx.tools.register(fixture('agy_tool', 'Antigravity bridge mirror tool'))
+    ctx.tools.register(fixture('some_tool', 'A deferred tool'))
+    const agent = await createAgent(ctx, 'agy-test')
+
+    // agy_tool is offered, some_tool is deferred
+    const tools = await offered(ctx, agent)
+    expect(tools).toContain('agy_tool')
+    expect(tools).not.toContain('some_tool')
+
+    // agy_tool is callable directly without being blocked
+    const ran = await execute(ctx, agent, 'agy_tool', {})
+    expect(ran.isError).toBe(false)
+    if (!ran.isError) {
+      expect(ran.value).toEqual([{ type: 'text', text: 'ran:agy_tool' }])
+    }
+  })
+
+  it('calls downstream system-prompt/assemble waterfall listeners without vetoing the chain', async () => {
+    const { ctx } = await harness({ defer: ['alpha'] })
+    ctx.tools.register(fixture('alpha', 'deferred tool'))
+    ctx.tools.register(fixture('beta', 'active tool'))
+    const agent = await createAgent(ctx, 'downstream-test')
+
+    let downstreamCalled = false
+    ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
+      downstreamCalled = true
+      const res = typeof next === 'function' ? await next() : assembly
+      return {
+        ...res,
+        sections: [...(res.sections ?? []), { name: 'downstream:section', text: 'hello from downstream' }],
+      }
+    })
+
+    const assembly = await ctx.systemPrompt.assemble({ scope: agent })
+    expect(downstreamCalled).toBe(true)
+    expect(assembly.sections?.some(s => s.name === 'downstream:section')).toBe(true)
+    expect(assembly.tools.map(t => t.name)).not.toContain('alpha')
+    expect(assembly.tools.map(t => t.name)).toContain('beta')
   })
 })

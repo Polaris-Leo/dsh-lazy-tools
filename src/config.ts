@@ -26,7 +26,17 @@ import { DEFAULT_ACTIVE_TOOLS, DEFER_ALL_ENTRY, resolveDeferPatterns } from './p
  * and the reserved presentation transport is not a capability the model may be
  * locked out of (a PTC-mode agent whose only tool was hidden would see nothing).
  */
-export const GUARD_TOOLS = ['tool_search', 'defer_execute_tool', RUN_CODE_NAME] as const
+export const GUARD_TOOLS = ['tool_search', 'defer_execute_tool', RUN_CODE_NAME, 'agy_tool'] as const
+
+/**
+ * Predicate checking whether a tool is a built-in guard or core AGY transport tool
+ * that must never be deferred or denied.
+ */
+export function isGuardTool(name: string): boolean {
+  if ((GUARD_TOOLS as readonly string[]).includes(name)) return true
+  if (name === 'agy' || name.startsWith('agy_') || name.startsWith('agy:')) return true
+  return false
+}
 
 /** Resolved plugin config surface after schemastery validation. */
 export interface LazyToolsConfig {
@@ -39,7 +49,7 @@ export interface LazyToolsConfig {
 // Re-exported so the Host half keeps one import site for its configuration
 // surface. The values themselves live in ./preset.ts, which the browser half can
 // load without pulling in `@deepseek-ai/dsh-tools`.
-export { DEFAULT_ACTIVE_TOOLS, DEFER_ALL_ENTRY }
+export { DEFAULT_ACTIVE_TOOLS, DEFER_ALL_ENTRY, RUN_CODE_NAME }
 
 /**
  * Resolve the configured patterns, applying the shipped preset when the config
@@ -149,7 +159,7 @@ export function resolveDeferConfig(
 
   const deferNames = new Set<string>()
   for (const name of allToolNames) {
-    if (noDeferNames.has(name) || (GUARD_TOOLS as readonly string[]).includes(name)) continue
+    if (noDeferNames.has(name) || isGuardTool(name)) continue
     for (const matcher of deferMatchers) {
       if (matcher.action === 'defer' && compilePattern(matcher.pattern)(name)) {
         deferNames.add(name)

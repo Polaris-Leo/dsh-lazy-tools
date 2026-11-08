@@ -138,8 +138,15 @@ describe('unconfigured form display', () => {
     c.dispose()
   })
 
-  it('shows an explicit config as written, without re-adding the preset core', () => {
+  it('shows defer-only config with DEFAULT_ACTIVE_TOOLS baseline in noDefer', () => {
     const c = controllerFor({ defer: ['glob'] })
+    expect(c.read('defer')?.text).toBe('glob')
+    expect(c.read('noDefer')?.text).toBe(DEFAULT_ACTIVE_TOOLS.filter((t) => t !== 'glob').join(', '))
+    c.dispose()
+  })
+
+  it('shows an explicit empty noDefer as empty', () => {
+    const c = controllerFor({ defer: ['glob'], noDefer: [] })
     expect(c.read('defer')?.text).toBe('glob')
     expect(c.read('noDefer')?.text).toBe('')
     c.dispose()

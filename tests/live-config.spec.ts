@@ -24,14 +24,12 @@ import type { Fiber } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { ToolCallId, type JsonValue } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { defineContentToolFixture, type ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture, executeTool } from './fixture-tools.ts'
 import * as LazyTools from '../src/index.ts'
 import { type Config } from '../src/index.ts'
 
-/** One monotonically increasing call id, as the other suites use. */
-let callOrdinal = 0
 
 /**
  * The write symbol a volatile reference exposes; `Symbol.for` reaches the same
@@ -42,7 +40,6 @@ const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
 /** Contexts torn down after each case, so no listener leaks between tests. */
 const contexts: Context[] = []
 afterEach(async () => {
-  callOrdinal = 0
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
 })
 
@@ -72,7 +69,7 @@ function settingsSave(ctx: Context, plugin: Fiber, next: Config): void {
   const candidate = (LazyTools.Config as unknown as {
     '~standard': { validate(value: unknown): { value: LiveRefs } }
   })['~standard'].validate(next).value
-  const refs = plugin.config as unknown as LiveRefs
+  const refs = ((plugin as any)._effectiveConfig ?? plugin.config) as unknown as LiveRefs
   for (const [key, ref] of Object.entries(refs)) {
     const source = candidate[key as keyof LiveRefs]
     if (source === undefined) continue
@@ -110,13 +107,7 @@ async function offered(ctx: Context, agent: Agent): Promise<string[]> {
 
 /** Execute one tool call, for exercising the guard. */
 async function execute(ctx: Context, agent: Agent, name: string): Promise<ToolExecutionResult> {
-  return await ctx.tools.execute({
-    callId: ToolCallId(`live-${(callOrdinal += 1)}-${name}`),
-    name,
-    arguments: {} as JsonValue,
-    agent,
-    signal: new AbortController().signal,
-  })
+  return await executeTool(ctx, agent, name)
 }
 
 describe('live configuration edits', () => {
