@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
 ### Changed
 
 - **The configuration page now lives on the Plugins page.** It moved from
@@ -31,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller**, so an edit staged on either page is visible on the other and a
   save is a single revision-fenced write. The **Subagent** plugin has no such
   second surface, which is why comparing the two did not reveal it.
+- **Retargeted at DeepSeek Harness 0.2.2-rc.1.** The manifest declares
+  `engines.dsh: ">=0.2.0-rc.2 <=0.2.2-rc.1"` (the compatibility gate reads that
+  key and then ignores peer ranges) and the `@deepseek-ai/dsh-*` peers restate
+  the same window. The lower bound is a hard requirement: 0.2.2-rc.1 stopped
+  handing `tools` to the `system-prompt/assemble` waterfall, so hiding moved to
+  the per-scope `agent.ctx.tools.restrict({ deny })` mask. DSH applies that mask
+  to both the prompt tool provider and dispatch lookup, so a direct call to a
+  still-deferred tool keeps the guard's "call `tool_search` first" refusal —
+  the pipeline runs `tools/pre-execute` before it resolves the tool.
+- **The search catalog is read from the registry, not from the assembly.** The
+  per-agent catalog is rebuilt from `ctx.tools.schemas(agent)` with this
+  plugin's own mask lifted first, so a deferred tool stays discoverable while a
+  tool another policy denies stays out of `tool_search` and reports
+  `unavailable`.
 
 ### Added
 
@@ -97,14 +113,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependabot configuration, issue and pull-request templates, and the standard
   community files (`LICENSE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
   `SECURITY.md`).
+- **PTC `tools:sdk` filtering.** In Programmatic Tool Calling mode the model
+  receives compiled SDK declarations instead of native tool schemas. Deferred
+  tools are now filtered out of that block as well, so a PTC agent gets the same
+  context saving as a native-calling one.
 
 ### Fixed
 
 - Deferred loading now works on the Web/Desktop surfaces. Those surfaces mount
   every model-facing tool through a per-session agent preset, so the global tool
   layer the plugin used to read is empty there and nothing was ever deferred.
-  Hiding now happens on the model-facing `system-prompt/assemble` list — which
-  is plane-agnostic — and the registry is left untouched.
+  Hiding is driven by the per-scope `restrict` mask instead, which reaches
+  inherited and ancestor-plane tools alike, and the registry is left untouched.
+- Auto-tune measures its ranking window with the same clock the daily throttle
+  decides on. A caller-supplied `now` used to be dropped before the scan, so a
+  run could rank one window and stamp another.
 - `tool_search` reports `unavailable` for an exact name it cannot reach instead
   of silently returning an empty result.
 - The reserved `run_code` transport is pinned as a guard, so `Defer(*)` cannot
@@ -139,5 +162,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `defer_execute_tool`, the `tools/pre-execute` guard, and the
   `Defer(...)` / `NoDefer(...)` / `deferToolLoading` configuration surface.
 
-[Unreleased]: https://github.com/studyzy/dsh-lazy-tools/compare/master...HEAD
+[Unreleased]: https://github.com/studyzy/dsh-lazy-tools/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/studyzy/dsh-lazy-tools/releases/tag/v0.1.0
 [0.0.1]: https://github.com/studyzy/dsh-lazy-tools/releases/tag/v0.0.1
