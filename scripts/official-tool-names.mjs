@@ -8,7 +8,6 @@
  *   node scripts/official-tool-names.mjs [path/to/app.asar]
  */
 import fs from 'node:fs'
-import path from 'node:path'
 
 const asar = process.argv[2]
   ?? 'D:/Users/ldc/AppData/Local/Programs/DeepSeek Harness/resources/app.asar'
