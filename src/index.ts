@@ -186,6 +186,8 @@ interface AgentState {
   removeRestriction: (() => void) | undefined
   /** Deny list the live mask was built from; empty when no mask is in force. */
   restrictionSignature: string
+  /** Whether the last mask failure was already logged, so a retry stays quiet. */
+  maskWarned: boolean
 }
 
 /**
@@ -388,6 +390,7 @@ export function apply(ctx: Context, config: LiveConfig): void {
         try {
           state.removeRestriction = state.agent.ctx.tools.restrict({ deny: remaining })
           state.restrictionSignature = signature
+          state.maskWarned = false
           return
         } catch (error: unknown) {
           // A tool registered in this agent's own scope is exempt from
@@ -395,7 +398,12 @@ export function apply(ctx: Context, config: LiveConfig): void {
           const unknown = unknownRestrictionNames(error)
           const next = remaining.filter((name) => !unknown.has(name))
           if (next.length === 0 || next.length === remaining.length) {
-            ctx.logger.warn(`lazy-tools: could not mask deferred tools (${errorMessage(error)}); the call guard still withholds them`)
+            // Logged once: the mask is retried on every assembly, and an agent
+            // whose context never went active would otherwise warn per step.
+            if (!state.maskWarned) {
+              state.maskWarned = true
+              ctx.logger.warn(`lazy-tools: could not mask deferred tools (${errorMessage(error)}); the call guard still withholds them`)
+            }
             return
           }
           remaining = next
@@ -471,6 +479,7 @@ export function apply(ctx: Context, config: LiveConfig): void {
       removeTools: [],
       removeRestriction: undefined,
       restrictionSignature: '',
+      maskWarned: false,
     }
     states.set(agent, state)
     try {
@@ -513,8 +522,28 @@ export function apply(ctx: Context, config: LiveConfig): void {
 
   // DSH 0.2.2 assembles the presentation without the tool declarations: the
   // model-facing list and the PTC `tools:sdk` section both come from the
-  // restricted registry view this plugin masks per agent. There is nothing
-  // left to filter here, so the old `system-prompt/assemble` listener is gone.
+  // restricted registry view this plugin masks per agent, so there is nothing
+  // to filter here. Assembly is instead the repair point for the mask. It runs
+  // inside the agent's own turn, where that agent's context is guaranteed live,
+  // while a background refresh (profile reload, preset churn, shutdown) can find
+  // it inactive and have `restrict()` rejected with INACTIVE_EFFECT. Repairing
+  // here keeps such a rejection from outliving the step that hit it.
+  ctx.on('system-prompt/assemble', (_presentation, context, next) => {
+    const scope = context.scope
+    const state = scope === undefined ? undefined : states.get(scope as Agent)
+    // Cheap gate first: a healthy agent pays one signature comparison per step.
+    // Only a mask that is missing or stale is repaired, because `refresh` has to
+    // lift the live mask to re-read the catalog, and doing that every step would
+    // swap the restriction on every request.
+    if (state !== undefined && signatureOf(denyNames(state)) !== state.restrictionSignature) {
+      try {
+        refresh(state)
+      } catch (error: unknown) {
+        ctx.logger.warn(`lazy-tools: could not repair the defer mask before assembly (${errorMessage(error)})`)
+      }
+    }
+    return next()
+  })
   ctx.on('agent/created', ({ agent }) => {
     install(agent)
     tuneForAgent(agent)

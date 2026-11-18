@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-18
+
+### Changed
+
+- **Retargeted at DeepSeek Harness 0.2.2-rc.3.** `engines.dsh` is now
+  `>=0.2.2-rc.1 <0.3.0-0`, and the six `@deepseek-ai/dsh-*` peers restate that
+  window; the build targets 0.2.2-rc.3. The previous declaration capped the
+  window at `<=0.2.2-rc.1`, which put 0.2.2-rc.3 outside it: the compatibility
+  gate then refused to load the plugin entirely, so a user on that build saw
+  neither the card nor either tool, and nothing in the log named the manifest
+  key that caused it.
+
+### Fixed
+
+- **A mask rejected by an inactive agent context is repaired instead of
+  degrading silently.** Hiding runs through `agent.ctx.tools.restrict()`, which
+  the host refuses with `cannot create effect on inactive context` whenever the
+  agent's own context is not active — as it is during a profile reload, preset
+  churn, or shutdown, when the registry refresh that follows a `tools/change`
+  arrives after that context went inert. The plugin retried nothing, so it
+  logged `could not mask deferred tools` and left every deferred tool visible on
+  the wire for the rest of the process, while the call guard still withheld
+  direct calls — an agent could be told the tool was deferred and then never see
+  it disappear. The mask is now re-applied at `system-prompt/assemble`, which
+  always runs inside the agent's own turn, so the first request after such a
+  rejection already carries the corrected tool list. A healthy agent pays one
+  signature comparison per step, not a mask swap, and the failure is logged once
+  rather than once per refresh.
+
 ## [0.1.0] - 2026-11-08
 
 ### Changed
@@ -162,6 +191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `defer_execute_tool`, the `tools/pre-execute` guard, and the
   `Defer(...)` / `NoDefer(...)` / `deferToolLoading` configuration surface.
 
-[Unreleased]: https://github.com/studyzy/dsh-lazy-tools/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/studyzy/dsh-lazy-tools/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/studyzy/dsh-lazy-tools/releases/tag/v0.1.1
 [0.1.0]: https://github.com/studyzy/dsh-lazy-tools/releases/tag/v0.1.0
 [0.0.1]: https://github.com/studyzy/dsh-lazy-tools/releases/tag/v0.0.1

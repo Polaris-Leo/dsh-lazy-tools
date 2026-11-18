@@ -359,4 +359,41 @@ describe('deferred tool loading', () => {
     expect(assembly.tools.map(t => t.name)).not.toContain('alpha')
     expect(assembly.tools.map(t => t.name)).toContain('beta')
   })
+
+  it('repairs a mask rejected while the agent context was inactive', async () => {
+    const { ctx } = await harness({ defer: ['glob'] })
+    ctx.tools.register(fixture('read_file', 'Read a local file'))
+    ctx.tools.register(fixture('glob', 'Find files by pattern'))
+
+    // The DSH rejection this plugin hits when `restrict()` runs while the
+    // agent's own context is not active (profile reload, preset churn).
+    const service = ctx.tools as unknown as {
+      restrict(filter: { deny: string[] }): () => void
+    }
+    // Unbound: `restrict` reads the scope of the context it is CALLED ON, so the
+    // patched stand-in has to forward the caller's `this`, not the root service.
+    const original = service.restrict
+    let inactive = true
+    let attempts = 0
+    service.restrict = function (this: unknown, filter: { deny: string[] }) {
+      attempts += 1
+      if (inactive) throw new Error('cannot create effect on inactive context')
+      return original.call(this, filter)
+    }
+    try {
+      const agent = await createAgent(ctx, 'inactive-mask')
+      // Nothing was masked, so the deferred tool is still offered.
+      expect(await offered(ctx, agent)).toContain('glob')
+
+      // Assembly runs inside the agent's turn: it repairs the mask, and the
+      // request after it is withheld again.
+      inactive = false
+      const before = attempts
+      await offered(ctx, agent)
+      expect(attempts).toBeGreaterThan(before)
+      expect(await offered(ctx, agent)).not.toContain('glob')
+    } finally {
+      service.restrict = original
+    }
+  })
 })
